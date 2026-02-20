@@ -1,0 +1,566 @@
+---
+title: "Lab 5: Optimal Dike Height"
+subtitle: "CEVE 421/521"
+date: 2026-02-20
+engine: julia
+status: draft
+
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-block-bg: "#f8f8f8"
+    code-block-border-left: "#e1e4e5"
+    theme:
+      - simplex
+      - _assets/sass/custom.scss
+    number-sections: true
+    fig-format: svg
+  typst:
+    fontsize: 11pt
+    margin:
+      x: 1in
+      y: 1in
+    number-sections: true
+    fig-format: svg
+
+execute:
+  exeflags: ["+1.12", "--project=@.", "--threads=auto"]
+  cache: true
+  freeze: auto
+
+code-overflow: wrap
+code-line-numbers: false
+code-block-font-size: "0.85em"
+---
+
+## Overview
+
+In Lab 4, you ran ICOW to analyze flood risk for a city with a fixed dike.
+Today you'll flip the question: **how tall should the dike be?**
+
+A taller dike costs more to build but reduces expected flood damage.
+We'll use optimization to find the height that minimizes total cost, then see how the answer shifts under different sea-level rise assumptions.
+
+
+**References:**
+
+- [ICOW.jl documentation](https://dossgollin-lab.github.io/ICOW.jl/)
+- [SimOptDecisions documentation](https://dossgollin-lab.github.io/SimOptDecisions/)
+
+## Before Lab
+
+**Complete these steps BEFORE coming to lab:**
+
+1. **Accept the GitHub Classroom assignment** (link on Canvas)
+
+2. **Clone your repository:**
+   ```bash
+   git clone https://github.com/CEVE-421-521/lab-05-S26-yourusername.git
+   cd lab-05-S26-yourusername
+   ```
+
+3. **Open the notebook** in VS Code or Quarto preview
+
+4. **Run the first code cell** — it will automatically install any missing packages (this may take 10-15 minutes the first time)
+
+::: {.callout-important}
+**Submission:** You will render this notebook to PDF and submit the PDF to Canvas.
+See @sec-submission for details.
+:::
+
+## Setup
+
+### Load Packages
+
+```{julia}
+#| output: false
+# install SimOptDecisions and ICOW
+try
+    using SimOptDecisions
+    using ICOW
+catch
+    import Pkg
+    try
+        Pkg.rm("SimOptDecisions")
+    catch
+    end
+    try
+        Pkg.rm("ICOW")
+    catch
+    end
+    Pkg.add(; url="https://github.com/dossgollin-lab/SimOptDecisions")
+    Pkg.add(; url="https://github.com/dossgollin-lab/ICOW.jl")
+    Pkg.instantiate()
+    using SimOptDecisions
+    using ICOW
+end
+using ICOW.EAD
+```
+
+```{julia}
+#| output: false
+using CairoMakie
+using DataFrames
+using Metaheuristics
+using NetCDF
+using Random
+using Statistics
+
+include("sea_level_data.jl")
+
+Random.seed!(2026)
+```
+
+### Storm Surge Parameters
+
+Same GEV surge distribution as Lab 4: location $\mu$ sets the typical annual max, scale $\sigma$ controls the spread, and shape $\xi > 0$ gives a heavy tail (rare but very large surges are possible).
+
+```{julia}
+#| output: false
+μ = 3.0   # GEV location (m) — typical annual max surge
+σ = 1.0   # GEV scale (m) — spread of annual maxima
+ξ = 0.15  # GEV shape — positive means heavy-tailed
+```
+
+## Set Up the Optimization
+
+In lecture you saw the XLRM framework: e**X**ogenous uncertainties, **L**evers, **R**elationships (the model), and **M**etrics.
+This lab puts all four pieces together computationally — ICOW is the model (R), the surge and SLR scenarios are the uncertainties (X), dike height is the lever (L), and total cost is the metric (M).
+
+### The Decision: How Tall Should the Dike Be?
+
+ICOW's `StaticPolicy` has five defense levers (withdrawal, dike height, dike base, resistance, and flood-proofing).
+We'll fix four and optimize only `a_frac` — the fraction of city elevation allocated to dike height.
+With our defaults, $D = 0.8 \times \texttt{a\_frac} \times 17\text{m}$, so `a_frac = 0.3` gives roughly a 4m dike.
+
+```{julia}
+#| output: false
+# Fixed defense parameters (no withdrawal, resistance, or flood-proofing)
+const W_FRAC = 0.0   # no withdrawal
+const B_FRAC = 0.2   # reasonable dike base
+const R_FRAC = 0.0   # no resistance height
+const P_FRAC = 0.0   # no flood-proofing
+```
+
+### Scenario: Surge + Sea-Level Rise
+
+An `EADScenario` bundles everything the decision-maker can't control: the surge hazard (GEV parameters), a sea-level rise trajectory (from BRICK), and a discount rate.
+ICOW uses these to compute expected annual damage at each year, then discounts future costs back to present value.
+
+Let's start with the RCP 8.5 median over a 50-year planning horizon.
+
+```{julia}
+#| output: false
+brick_data = load_brick_projections()
+rcp85 = get_brick_scenario(brick_data, "rcp85")
+rcp85_quantiles = brick_quantiles(rcp85, [0.5])
+
+n_years = 50
+slr_rcp85_median = rcp85_quantiles[1:n_years, 1]
+
+config = EADConfig(; n_years=n_years)
+scenario_rcp85 = EADScenario(;
+    surge_loc=μ,
+    surge_scale=σ,
+    surge_shape=ξ,
+    mean_sea_level=slr_rcp85_median,
+    discount_rate=0.03,
+)
+```
+
+### Objective: Minimize Total Cost
+
+Total cost = investment (building the dike) + expected damage (flood losses), both discounted to net present value.
+This is the benefit-cost framework from lecture: we want the dike height where the marginal cost of building higher equals the marginal reduction in expected damage.
+
+The `calculate_metrics` function receives one outcome per scenario, sums investment + damage for each, and averages across scenarios.
+With a single scenario the average is trivial, but this matters when we optimize over an ensemble later.
+
+```{julia}
+#| output: false
+function calculate_metrics(outcomes)
+    total_costs = [
+        SimOptDecisions.value(o.investment) + SimOptDecisions.value(o.expected_damage)
+        for o in outcomes
+    ]
+    return (; total_cost=mean(total_costs))
+end
+```
+
+### Sanity Check
+
+Before letting an optimizer loose, it's good practice to evaluate a few policies by hand.
+`evaluate_policy` runs the ICOW model for a given policy and scenario — the same EAD calculation you saw in Lab 4, but now repeated for different dike heights.
+
+```{julia}
+#| label: tbl-sanity-check
+#| tbl-cap: "Total cost for different dike heights under RCP 8.5 median SLR"
+let
+    results = map([0.0, 0.1, 0.2, 0.3, 0.4, 0.5]) do a
+        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
+        fd = FloodDefenses(policy, config)
+        metrics = evaluate_policy(config, [scenario_rcp85], policy, calculate_metrics)
+        (a_frac=a, dike_height_m=round(fd.D; digits=1), total_cost_B=round(metrics.total_cost / 1e9; digits=2))
+    end
+    DataFrame(results)
+end
+```
+
+::: {.callout-tip appearance="simple" icon=false title="Question 1"}
+*Look at @tbl-sanity-check.
+The total cost first decreases, then increases as `a_frac` grows.
+What two forces create this U-shaped cost curve?
+Why is neither `a_frac = 0` nor `a_frac = 0.5` optimal?*
+:::
+
+
+## Find the Optimal Dike Height
+
+### How `SimOptDecisions.optimize()` Works
+
+The sanity check showed a U-shaped cost curve — there's a minimum somewhere in the middle.
+Instead of testing every value by hand, we use `SimOptDecisions.optimize()` to search automatically.
+Here's what it does on each iteration:
+
+1. Propose a candidate `a_frac` value
+2. Build a `StaticPolicy` from it (plus our fixed parameters)
+3. Run ICOW via `simulate()` for that policy against each scenario
+4. Pass the results to `calculate_metrics` (sum investment + damage, average across scenarios)
+5. Use the metric to decide where to search next
+
+This repeats for `max_iterations × population_size` evaluations.
+The result contains `pareto_params` (best parameters found) and `pareto_objectives` (corresponding cost).
+
+We use ECA (Evolutionary Centers Algorithm), a population-based metaheuristic that maintains multiple candidate solutions and iteratively improves them.
+We pass `bounds` for each `StaticPolicy` parameter; setting `lower == upper` fixes it, so only `a_frac` varies.
+
+### Single-Scenario Optimization
+
+
+```{julia}
+#| output: false
+backend = MetaheuristicsBackend(;
+    algorithm=:ECA,
+    max_iterations=50,
+    population_size=20,
+)
+
+bounds_dike_only = [
+    (0.0, 0.8),           # a_frac — free to optimize
+    (W_FRAC, W_FRAC),     # w_frac — fixed
+    (B_FRAC, B_FRAC),     # b_frac — fixed
+    (R_FRAC, R_FRAC),     # r_frac — fixed
+    (P_FRAC, P_FRAC),     # P — fixed
+]
+
+result_rcp85 = SimOptDecisions.optimize(
+    config,
+    [scenario_rcp85],
+    StaticPolicy,
+    calculate_metrics,
+    [minimize(:total_cost)];
+    backend=backend,
+    bounds=bounds_dike_only,
+)
+```
+
+### Inspect the Result
+
+```{julia}
+optimal_a_rcp85 = result_rcp85.pareto_params[1][1]
+optimal_cost_rcp85 = result_rcp85.pareto_objectives[1][1]
+
+optimal_policy_rcp85 = StaticPolicy(;
+    a_frac=optimal_a_rcp85, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC,
+)
+fd_rcp85 = FloodDefenses(optimal_policy_rcp85, config)
+
+println("Optimal a_frac: $(round(optimal_a_rcp85; digits=3))")
+println("Optimal dike height: $(round(fd_rcp85.D; digits=2)) m")
+println("Minimum total cost: \$$(round(optimal_cost_rcp85 / 1e9; digits=2))B")
+```
+
+### A Different Scenario
+
+That result assumed RCP 8.5.
+Let's re-optimize under RCP 2.6 (aggressive emissions cuts) and see how much the answer changes.
+
+```{julia}
+#| output: false
+rcp26 = get_brick_scenario(brick_data, "rcp26")
+rcp26_quantiles = brick_quantiles(rcp26, [0.5])
+slr_rcp26_median = rcp26_quantiles[1:n_years, 1]
+
+scenario_rcp26 = EADScenario(;
+    surge_loc=μ,
+    surge_scale=σ,
+    surge_shape=ξ,
+    mean_sea_level=slr_rcp26_median,
+    discount_rate=0.03,
+)
+
+result_rcp26 = SimOptDecisions.optimize(
+    config,
+    [scenario_rcp26],
+    StaticPolicy,
+    calculate_metrics,
+    [minimize(:total_cost)];
+    backend=backend,
+    bounds=bounds_dike_only,
+)
+```
+
+### Compare
+
+```{julia}
+#| label: tbl-scenario-comparison
+#| tbl-cap: "Optimal dike height under two different SLR scenarios"
+let
+    optimal_a_rcp26 = result_rcp26.pareto_params[1][1]
+    optimal_cost_rcp26 = result_rcp26.pareto_objectives[1][1]
+    fd_rcp26 = FloodDefenses(
+        StaticPolicy(; a_frac=optimal_a_rcp26, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC),
+        config,
+    )
+
+    DataFrame(
+        Scenario=["RCP 8.5 (median SLR)", "RCP 2.6 (median SLR)"],
+        Optimal_a_frac=[round(optimal_a_rcp85; digits=3), round(optimal_a_rcp26; digits=3)],
+        Dike_Height_m=[round(fd_rcp85.D; digits=2), round(fd_rcp26.D; digits=2)],
+        Total_Cost_B=[
+            "\$$(round(optimal_cost_rcp85 / 1e9; digits=2))B",
+            "\$$(round(optimal_cost_rcp26 / 1e9; digits=2))B",
+        ],
+    )
+end
+```
+
+### Visualize the Cost Curves
+
+```{julia}
+#| label: fig-cost-curves
+#| fig-cap: "Total cost vs. dike height under two SLR scenarios. Stars mark the optima."
+let
+    a_values = 0.0:0.01:0.6
+    costs_rcp85 = map(a_values) do a
+        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
+        metrics = evaluate_policy(config, [scenario_rcp85], policy, calculate_metrics)
+        metrics.total_cost / 1e9
+    end
+    costs_rcp26 = map(a_values) do a
+        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
+        metrics = evaluate_policy(config, [scenario_rcp26], policy, calculate_metrics)
+        metrics.total_cost / 1e9
+    end
+
+    fig = Figure(; size=(700, 400))
+    ax = Axis(
+        fig[1, 1];
+        xlabel="a_frac (dike investment fraction)",
+        ylabel="Total Cost (\$B)",
+        title="Cost Curves Under Two SLR Scenarios",
+    )
+
+    lines!(ax, collect(a_values), costs_rcp85; color=:red, linewidth=2, label="RCP 8.5 median")
+    lines!(ax, collect(a_values), costs_rcp26; color=:blue, linewidth=2, label="RCP 2.6 median")
+
+    # Mark optima
+    scatter!(
+        ax,
+        [optimal_a_rcp85],
+        [optimal_cost_rcp85 / 1e9];
+        color=:red,
+        markersize=15,
+        marker=:star5,
+    )
+    optimal_a_rcp26 = result_rcp26.pareto_params[1][1]
+    optimal_cost_rcp26 = result_rcp26.pareto_objectives[1][1]
+    scatter!(
+        ax,
+        [optimal_a_rcp26],
+        [optimal_cost_rcp26 / 1e9];
+        color=:blue,
+        markersize=15,
+        marker=:star5,
+    )
+
+    axislegend(ax; position=:rt)
+    fig
+end
+```
+
+::: {.callout-tip appearance="simple" icon=false title="Question 2"}
+*Look at @tbl-scenario-comparison and @fig-cost-curves.*
+
+1. *How different are the optimal dike heights under RCP 8.5 vs. RCP 2.6?
+   Are you surprised by how similar (or different) they are?*
+2. *Our planning horizon is 50 years and our discount rate is 3%.
+   How might each of these choices contribute to the similarity?
+   (Hint: RCP 8.5 and 2.6 diverge most after 2060-2070, and a 3% discount rate means a dollar of damage 50 years from now is worth only about \$0.22 today.)*
+3. *What changes to the problem setup — time horizon, discount rate, or something else — might make the two scenarios diverge more?*
+:::
+
+
+## Optimize Over an Ensemble {#sec-ensemble}
+
+The two median scenarios gave similar answers — but medians compress the full range of uncertainty into a single number.
+BRICK actually gives us many plausible SLR trajectories, some much more extreme than the median.
+What if we optimize over an *ensemble* of them at once?
+
+Each column of `get_brick_scenario()` is one ensemble member's trajectory.
+We build a vector of `EADScenario` objects — one per member — and pass them all to `optimize()`.
+Since `calculate_metrics` averages across outcomes, the optimizer finds the `a_frac` that minimizes *expected* total cost across the ensemble — implicitly treating each member as equally likely.
+
+```{julia}
+#| output: false
+N_ensemble = 10
+rcp85_full = get_brick_scenario(brick_data, "rcp85")
+
+ensemble_scenarios = [
+    EADScenario(;
+        surge_loc=μ,
+        surge_scale=σ,
+        surge_shape=ξ,
+        mean_sea_level=rcp85_full[1:n_years, i],
+        discount_rate=0.03,
+    )
+    for i in 1:N_ensemble
+]
+
+# Use fewer iterations — each evaluation is N_ensemble× more expensive
+ensemble_backend = MetaheuristicsBackend(;
+    algorithm=:ECA,
+    max_iterations=30,
+    population_size=15,
+)
+
+result_ensemble = SimOptDecisions.optimize(
+    config,
+    ensemble_scenarios,
+    StaticPolicy,
+    calculate_metrics,
+    [minimize(:total_cost)];
+    backend=ensemble_backend,
+    bounds=bounds_dike_only,
+)
+```
+
+```{julia}
+optimal_a_ensemble = result_ensemble.pareto_params[1][1]
+optimal_cost_ensemble = result_ensemble.pareto_objectives[1][1]
+fd_ensemble = FloodDefenses(
+    StaticPolicy(;
+        a_frac=optimal_a_ensemble, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC,
+    ),
+    config,
+)
+
+println("Ensemble-optimal a_frac: $(round(optimal_a_ensemble; digits=3))")
+println("Ensemble-optimal dike height: $(round(fd_ensemble.D; digits=2)) m")
+println("Minimum expected total cost: \$$(round(optimal_cost_ensemble / 1e9; digits=2))B")
+```
+
+### Check Convergence
+
+Metaheuristic optimizers don't guarantee they've found the true minimum — they can get stuck or bounce around, especially when each evaluation is expensive (here, each one runs ICOW across all ensemble members).
+
+Since we only have one free parameter, we can check by sweeping `a_frac` over a grid and plotting the cost curve.
+If the optimizer's star lands at the bottom, it converged.
+(For higher-dimensional problems this brute-force check wouldn't be feasible, which is why convergence diagnostics matter.)
+
+```{julia}
+#| label: fig-ensemble-convergence
+#| fig-cap: "Ensemble cost curve with optimizer result. If the star isn't at the bottom, increase `max_iterations`."
+let
+    a_values = 0.0:0.02:0.6
+    costs = map(a_values) do a
+        policy = StaticPolicy(; a_frac=a, w_frac=W_FRAC, b_frac=B_FRAC, r_frac=R_FRAC, P=P_FRAC)
+        metrics = evaluate_policy(config, ensemble_scenarios, policy, calculate_metrics)
+        metrics.total_cost / 1e9
+    end
+
+    fig = Figure(; size=(700, 400))
+    ax = Axis(
+        fig[1, 1];
+        xlabel="a_frac",
+        ylabel="Mean Total Cost (\$B)",
+        title="Ensemble Cost Curve — Convergence Check",
+    )
+    lines!(ax, collect(a_values), costs; color=:purple, linewidth=2)
+    scatter!(
+        ax,
+        [optimal_a_ensemble],
+        [optimal_cost_ensemble / 1e9];
+        color=:orange,
+        markersize=15,
+        marker=:star5,
+        label="optimizer result",
+    )
+    axislegend(ax; position=:rt)
+    fig
+end
+```
+
+If the star is off to one side, try increasing `max_iterations` (e.g., to 50 or 100) and re-running.
+
+::: {.callout-tip appearance="simple" icon=false title="Question 3"}
+*Compare the ensemble-optimal dike height to the RCP 8.5 and RCP 2.6 single-scenario optima above.
+Where does it fall, and why?
+What does the ensemble approach implicitly assume about the likelihood of different SLR trajectories?*
+:::
+
+
+## Reflection
+
+::: {.callout-tip appearance="simple" icon=false title="Question 4"}
+*We found that the "optimal" dike height depends on our assumptions about the future.
+If you were advising a city council, would you recommend optimizing for one scenario or an ensemble?
+What are the limitations of either approach, and why might we want something beyond optimization?*
+:::
+
+
+## Enrichment (Optional) {.unnumbered}
+
+If you finish early, try one of these:
+
+- **Uncertain discount rate:** Re-optimize with discount rates of 0.01, 0.03, and 0.07.
+  Which parameter — SLR or discount rate — has more influence on the optimal dike height?
+- **Multi-objective:** Minimize investment and expected damage separately using `[minimize(:investment), minimize(:expected_damage)]`.
+  What does the Pareto front look like?
+
+## Summary
+
+Key takeaways:
+
+1. **Optimization balances investment against expected damage** — finding the dike height where marginal cost equals marginal benefit
+2. **The answer depends on framing** — time horizon, discount rate, and scenario choice all shape the "optimal"
+3. **Ensemble optimization hedges across futures** — but the result depends on which futures you include and how you weight them
+4. **Always verify your optimizer** — metaheuristics can fail to converge, especially with expensive evaluations
+
+## Submission {#sec-submission}
+
+1. Write your answers in the response boxes above
+2. **Render to PDF:**
+   - In VS Code: Open the command palette (`Cmd+Shift+P` / `Ctrl+Shift+P`) → "Quarto: Render Document" → select Typst PDF
+   - Or from the terminal: `quarto render index.qmd --to typst`
+3. **Submit the PDF** to the Lab 5 assignment on Canvas
+4. **Push your code** to GitHub (for backup):
+   ```bash
+   git add -A && git commit -m "Lab 5 complete" && git push
+   ```
+
+## Checklist {.unnumbered}
+
+Before submitting:
+
+- [ ] Packages load without error
+- [ ] Sanity check table computed (@tbl-sanity-check)
+- [ ] Question 1 answered (U-shaped cost curve)
+- [ ] Single-scenario optimization completed for RCP 8.5 and RCP 2.6
+- [ ] Scenario comparison table (@tbl-scenario-comparison) and cost curves (@fig-cost-curves) generated
+- [ ] Question 2 answered (scenario similarity and what drives it)
+- [ ] Ensemble results reviewed (@sec-ensemble)
+- [ ] Question 3 answered (ensemble vs. single-scenario comparison)
+- [ ] Question 4 answered (reflection)
+- [ ] Notebook renders to PDF without errors
